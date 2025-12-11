@@ -1,0 +1,357 @@
+local ReplicatedStorage = game:GetService('ReplicatedStorage')
+local Players = game:GetService('Players')
+local UserInputService = game:GetService('UserInputService')
+local RunService = game:GetService('RunService')
+local TweenService = game:GetService('TweenService')
+
+if not ReplicatedStorage:FindFirstChild('GameRemotes') then
+    local folder = Instance.new('Folder')
+    folder.Name = 'GameRemotes'
+    folder.Parent = ReplicatedStorage
+end
+
+local GameRemotes = ReplicatedStorage:WaitForChild('GameRemotes')
+
+local function ensureRemote(name, klass)
+    local rem = GameRemotes:FindFirstChild(name)
+    if rem and rem.ClassName == klass then
+        return rem
+    end
+    rem = Instance.new(klass)
+    rem.Name = name
+    rem.Parent = GameRemotes
+    return rem
+end
+
+local RemoteInput = ensureRemote('RemoteInput', 'RemoteEvent')
+local RemoteAction = ensureRemote('RemoteAction', 'RemoteFunction')
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild('PlayerGui')
+
+local camera = workspace.CurrentCamera
+
+local Controller = {}
+Controller.__index = Controller
+
+function Controller.new(character)
+    local self = setmetatable({}, Controller)
+    self.Character = character
+    self.Humanoid = character:WaitForChild('Humanoid')
+    self.Root = character:WaitForChild('HumanoidRootPart')
+    self.MoveVector = Vector3.new(0,0,0)
+    self.Rotation = 0
+    self.Speed = 16
+    self.WalkSpeed = 16
+    self.SprintSpeed = 28
+    self.IsSprinting = false
+    self.IsCrouching = false
+    self.IsGrounded = true
+    self.JumpPower = 50
+    self.CanDoubleJump = true
+    self.DoubleJumped = false
+    self.Gravity = workspace.Gravity
+    self.Stamina = 100
+    self.MaxStamina = 100
+    self.StaminaRegenRate = 12
+    self.StaminaDrainRate = 25
+    self.DashCooldown = 1.2
+    self.CanDash = true
+    self.DashDistance = 40
+    self.DashSpeed = 120
+    self.Input = {Forward=false,Back=false,Left=false,Right=false,Jump=false,Crouch=false,Sprint=false,Dash=false}
+    self.ViewOffset = Vector3.new(0,1.5,0)
+    self.CameraMode = 'Follow'
+    self.EquipTool = nil
+    self.UI = {}
+    self:_createUI()
+    return self
+end
+
+function Controller:_createUI()
+    local screen = Instance.new('ScreenGui')
+    screen.Name = 'MovementUI'
+    screen.ResetOnSpawn = false
+    screen.Parent = playerGui
+    local staminaBar = Instance.new('Frame', screen)
+    staminaBar.Name = 'StaminaBar'
+    staminaBar.AnchorPoint = Vector2.new(0.5,1)
+    staminaBar.Position = UDim2.new(0.5,0,1,-60)
+    staminaBar.Size = UDim2.new(0.4,0,0,18)
+    staminaBar.BackgroundTransparency = 0.6
+    local inner = Instance.new('Frame', staminaBar)
+    inner.Name = 'Inner'
+    inner.Size = UDim2.new(1,0,1,0)
+    inner.AnchorPoint = Vector2.new(0,0)
+    local fill = Instance.new('Frame', inner)
+    fill.Name = 'Fill'
+    fill.Size = UDim2.new(1,0,1,0)
+    fill.AnchorPoint = Vector2.new(0,0)
+    self.UI.Screen = screen
+    self.UI.Bar = staminaBar
+    self.UI.Fill = fill
+end
+
+function Controller:_updateUI(dt)
+    local pct = math.clamp(self.Stamina / self.MaxStamina, 0, 1)
+    self.UI.Fill.Size = UDim2.new(pct,0,1,0)
+end
+
+function Controller:_applyMovement(dt)
+    local camCF = camera.CFrame
+    local forward = -camCF.LookVector
+    forward = Vector3.new(forward.X,0,forward.Z).Unit
+    local right = Vector3.new(camCF.RightVector.X,0,camCF.RightVector.Z).Unit
+    local mv = Vector3.new(0,0,0)
+    if self.Input.Forward then mv = mv + forward end
+    if self.Input.Back then mv = mv - forward end
+    if self.Input.Left then mv = mv - right end
+    if self.Input.Right then mv = mv + right end
+    if mv.Magnitude > 0 then mv = mv.Unit end
+    self.MoveVector = mv
+    local targetSpeed = self.IsSprinting and self.SprintSpeed or self.WalkSpeed
+    if self.IsCrouching then targetSpeed = targetSpeed * 0.5 end
+    self.Humanoid.WalkSpeed = targetSpeed
+    local vel = self.MoveVector * targetSpeed
+    local root = self.Root
+    local bodyVel = root:FindFirstChild('MG_BodyVelocity')
+    if not bodyVel then
+        bodyVel = Instance.new('BodyVelocity')
+        bodyVel.Name = 'MG_BodyVelocity'
+        bodyVel.MaxForce = Vector3.new(1e5,1e5,1e5)
+        bodyVel.Parent = root
+    end
+    bodyVel.Velocity = Vector3.new(vel.X, root.Velocity.Y, vel.Z)
+end
+
+function Controller:_handleStamina(dt)
+    if self.IsSprinting and (self.MoveVector.Magnitude > 0) then
+        self.Stamina = math.max(0, self.Stamina - self.StaminaDrainRate * dt)
+        if self.Stamina <= 0 then
+            self.IsSprinting = false
+        end
+    else
+        self.Stamina = math.min(self.MaxStamina, self.Stamina + self.StaminaRegenRate * dt)
+    end
+end
+
+function Controller:_tryJump()
+    if self.Humanoid:GetState() == Enum.HumanoidStateType.Seated then return end
+    if self.IsGrounded then
+        self.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        self.DoubleJumped = false
+    elseif not self.DoubleJumped and self.CanDoubleJump then
+        self.Root.Velocity = Vector3.new(self.Root.Velocity.X, 0, self.Root.Velocity.Z)
+        self.Root:ApplyImpulse(Vector3.new(0, self.JumpPower * 1.1, 0) * self.Root:GetMass())
+        self.DoubleJumped = true
+    end
+end
+
+function Controller:_tryDash()
+    if not self.CanDash or self.Stamina < 20 then return end
+    self.CanDash = false
+    self.Stamina = math.max(0, self.Stamina - 20)
+    local dir = self.MoveVector.Magnitude > 0 and self.MoveVector or Vector3.new(camera.CFrame.LookVector.X,0,camera.CFrame.LookVector.Z).Unit
+    local start = self.Root.Position
+    local goal = start + dir * self.DashDistance
+    local t = 0
+    local duration = 0.2
+    local mass = self.Root:GetMass()
+    local conn
+    conn = RunService.Heartbeat:Connect(function(dt)
+        t = t + dt
+        local alpha = math.clamp(t/duration,0,1)
+        local pos = start:Lerp(goal, alpha)
+        self.Root.CFrame = CFrame.new(pos) * CFrame.Angles(0, self.Root.Orientation.Y, 0)
+        if alpha >= 1 then
+            conn:Disconnect()
+        end
+    end)
+    delay(self.DashCooldown, function() self.CanDash = true end)
+end
+
+function Controller:Equip(tool)
+    self.EquipTool = tool
+    RemoteInput:FireServer('Equip', tool and tool.Name or '')
+end
+
+function Controller:Unequip()
+    if self.EquipTool then
+        RemoteInput:FireServer('Unequip', self.EquipTool.Name)
+        self.EquipTool = nil
+    end
+end
+
+function Controller:Update(dt)
+    self:_handleStamina(dt)
+    self:_applyMovement(dt)
+    self:_updateUI(dt)
+end
+
+local Controllers = {}
+
+local function onCharacterAdded(char)
+    local c = Controller.new(char)
+    Controllers[char] = c
+    local humanoid = c.Humanoid
+    humanoid.Running:Connect(function(speed)
+        c.IsGrounded = humanoid.FloorMaterial ~= Enum.Material.Air
+    end)
+    humanoid.StateChanged:Connect(function(old,new)
+        if new == Enum.HumanoidStateType.Freefall then
+            c.IsGrounded = false
+        elseif new == Enum.HumanoidStateType.Landed then
+            c.IsGrounded = true
+            c.DoubleJumped = false
+        end
+    end)
+    local root = c.Root
+    root.ChildRemoved:Connect(function(child)
+        if child.Name == 'MG_BodyVelocity' then
+        end
+    end)
+end
+
+if LocalPlayer.Character then onCharacterAdded(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+
+local currentController
+LocalPlayer.CharacterAdded:Wait()
+currentController = Controllers[LocalPlayer.Character]
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    local key = input.KeyCode
+    if key == Enum.KeyCode.W then currentController.Input.Forward = true end
+    if key == Enum.KeyCode.S then currentController.Input.Back = true end
+    if key == Enum.KeyCode.A then currentController.Input.Left = true end
+    if key == Enum.KeyCode.D then currentController.Input.Right = true end
+    if key == Enum.KeyCode.LeftShift then
+        currentController.Input.Sprint = true
+        currentController.IsSprinting = true
+    end
+    if key == Enum.KeyCode.LeftControl then
+        currentController.Input.Crouch = true
+        currentController.IsCrouching = true
+        currentController.Humanoid.WalkSpeed = currentController.Humanoid.WalkSpeed * 0.5
+    end
+    if key == Enum.KeyCode.Space then
+        currentController.Input.Jump = true
+        currentController:_tryJump()
+    end
+    if key == Enum.KeyCode.E then
+        RemoteInput:FireServer('Interact')
+    end
+    if key == Enum.KeyCode.F then
+        currentController.Input.Dash = true
+        currentController:_tryDash()
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    local key = input.KeyCode
+    if key == Enum.KeyCode.W then currentController.Input.Forward = false end
+    if key == Enum.KeyCode.S then currentController.Input.Back = false end
+    if key == Enum.KeyCode.A then currentController.Input.Left = false end
+    if key == Enum.KeyCode.D then currentController.Input.Right = false end
+    if key == Enum.KeyCode.LeftShift then
+        currentController.Input.Sprint = false
+        currentController.IsSprinting = false
+    end
+    if key == Enum.KeyCode.LeftControl then
+        currentController.Input.Crouch = false
+        currentController.IsCrouching = false
+    end
+    if key == Enum.KeyCode.Space then currentController.Input.Jump = false end
+    if key == Enum.KeyCode.F then currentController.Input.Dash = false end
+end)
+
+local mouse = LocalPlayer:GetMouse()
+mouse.Button1Down:Connect(function()
+    if currentController.EquipTool then
+        RemoteInput:FireServer('Primary', currentController.EquipTool.Name)
+    end
+end)
+
+mouse.Button2Down:Connect(function()
+    if currentController.EquipTool then
+        RemoteInput:FireServer('Secondary', currentController.EquipTool.Name)
+    end
+end)
+
+local lastTick = tick()
+RunService.Heartbeat:Connect(function(dt)
+    if not currentController then
+        currentController = Controllers[LocalPlayer.Character]
+        if not currentController then return end
+    end
+    currentController:Update(dt)
+end)
+
+RemoteAction.OnClientInvoke = function(action, ...)
+    if action == 'RequestState' then
+        local c = Controllers[LocalPlayer.Character]
+        if not c then return {} end
+        return {Stamina = c.Stamina, Sprint = c.IsSprinting, Crouch = c.IsCrouching}
+    end
+    return nil
+end
+
+RemoteInput.OnClientEvent:Connect(function(a, b)
+    if a == 'Equip' then
+        local tool = LocalPlayer.Backpack:FindFirstChild(b) or LocalPlayer.Character:FindFirstChild(b)
+        if tool and tool:IsA('Tool') then
+            LocalPlayer.Character.Humanoid:EquipTool(tool)
+        end
+    elseif a == 'Unequip' then
+        local tool = LocalPlayer.Character:FindFirstChild(b)
+        if tool and tool:IsA('Tool') then
+            LocalPlayer.Character.Humanoid:UnequipTools()
+        end
+    end
+end)
+
+local function makeServerListeners()
+    local rs = game:GetService('RunService')
+    if RunService:IsServer() then
+        RemoteInput.OnServerEvent:Connect(function(player, cmd, arg)
+            if cmd == 'Equip' then
+                local plrChar = player.Character
+                if plrChar then
+                    local tool = player.Backpack:FindFirstChild(arg)
+                    if tool then
+                        player.Character.Humanoid:EquipTool(tool)
+                    end
+                end
+            elseif cmd == 'Unequip' then
+                if player.Character then
+                    player.Character.Humanoid:UnequipTools()
+                end
+            elseif cmd == 'Interact' then
+                local target = player:GetMouse().Target
+                if target and target:IsA('BasePart') then
+                    RemoteInput:FireClient(player, 'Interacted', target.Name)
+                end
+            elseif cmd == 'Primary' then
+                if player.Character then
+                    local tool = player.Character:FindFirstChild(arg) or player.Backpack:FindFirstChild(arg)
+                    if tool and tool:IsA('Tool') then
+                        tool:Activate()
+                    end
+                end
+            elseif cmd == 'Secondary' then
+                if player.Character then
+                    local tool = player.Character:FindFirstChild(arg) or player.Backpack:FindFirstChild(arg)
+                    if tool and tool:IsA('Tool') and tool:FindFirstChild('Secondary') then
+                        tool:FindFirstChild('Secondary'):Invoke()
+                    end
+                end
+            end
+        end)
+    end
+end
+
+makeServerListeners()
+
+
